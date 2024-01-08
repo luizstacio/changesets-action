@@ -1,3 +1,4 @@
+import * as core from "@actions/core";
 import { exec } from "@actions/exec";
 import * as github from "@actions/github";
 import fs from "fs-extra";
@@ -22,13 +23,57 @@ import resolveFrom from "resolve-from";
 // To avoid that, we ensure to cap the message to 60k chars.
 const MAX_CHARACTERS_PER_MESSAGE = 60000;
 
+const createAggregatedRelease = async (
+  octokit: ReturnType<typeof github.getOctokit>,
+  packages: Package[],
+  releaseName?: string,
+  tagName?: string
+) => {
+  const contentArr = await Promise.all(
+    packages.map(async (pkg) => {
+      let changelogFileName = path.join(pkg.dir, "CHANGELOG.md");
+      let changelog = await fs.readFile(changelogFileName, "utf8");
+
+      let changelogEntry = getChangelogEntry(
+        changelog,
+        pkg.packageJson.version
+      );
+
+      if (!changelogEntry) {
+        // we can find a changelog but not the entry for this version
+        // if this is true, something has probably gone wrong
+        throw new Error(
+          `Could not find changelog entry for ${pkg.packageJson.name}@${pkg.packageJson.version}`
+        );
+      }
+
+      return `## ${pkg.packageJson.name}@${pkg.packageJson.version}\n\n${changelogEntry.content}`;
+    })
+  );
+
+  const body = contentArr.join("\n\n");
+  const now = new Date();
+  const prerelease = packages.every((pkg) =>
+    pkg.packageJson.version.includes("-")
+  );
+  const name = releaseName || `Release ${now.toISOString()}`;
+  const tag_name = tagName || `release-${+now}`;
+
+  await octokit.repos.createRelease({
+    name,
+    tag_name,
+    body,
+    prerelease,
+    ...github.context.repo,
+  });
+};
+
 const createRelease = async (
   octokit: ReturnType<typeof github.getOctokit>,
   { pkg, tagName }: { pkg: Package; tagName: string }
 ) => {
   try {
     let changelogFileName = path.join(pkg.dir, "CHANGELOG.md");
-
     let changelog = await fs.readFile(changelogFileName, "utf8");
 
     let changelogEntry = getChangelogEntry(changelog, pkg.packageJson.version);
@@ -47,18 +92,20 @@ const createRelease = async (
       prerelease: pkg.packageJson.version.includes("-"),
       ...github.context.repo,
     });
-  } catch (err: any) {
+  } catch (err) {
     // if we can't find a changelog, the user has probably disabled changelogs
-    if (err.code !== "ENOENT") {
+    if ((err as any).code !== "ENOENT") {
       throw err;
     }
   }
 };
 
-type PublishOptions = {
+export type PublishOptions = {
   script: string;
   githubToken: string;
-  createGithubReleases: boolean;
+  createGithubReleases: boolean | "aggregate";
+  githubReleaseName?: string;
+  githubTagName?: string;
   cwd?: string;
 };
 
@@ -77,6 +124,8 @@ export async function runPublish({
   script,
   githubToken,
   createGithubReleases,
+  githubReleaseName,
+  githubTagName,
   cwd = process.cwd(),
 }: PublishOptions): Promise<PublishResult> {
   let octokit = github.getOctokit(githubToken);
@@ -93,16 +142,21 @@ export async function runPublish({
   let { packages, tool } = await getPackages(cwd);
   let releasedPackages: Package[] = [];
 
+  let publishPackageRegex = /"(.+)("\s(at))/g;
+  let publishedSucceed = changesetPublishOutput.stdout.includes(
+    `published successfully`
+  );
+  let lines = changesetPublishOutput.stdout.matchAll(publishPackageRegex);
+
+  if (!publishedSucceed) {
+    return { published: false };
+  }
+
   if (tool !== "root") {
-    let newTagRegex = /New tag:\s+(@[^/]+\/[^@]+|[^/]+)@([^\s]+)/;
     let packagesByName = new Map(packages.map((x) => [x.packageJson.name, x]));
 
-    for (let line of changesetPublishOutput.stdout.split("\n")) {
-      let match = line.match(newTagRegex);
-      if (match === null) {
-        continue;
-      }
-      let pkgName = match[1];
+    for (let line of lines) {
+      let pkgName = line[1]?.trim();
       let pkg = packagesByName.get(pkgName);
       if (pkg === undefined) {
         throw new Error(
@@ -113,7 +167,7 @@ export async function runPublish({
       releasedPackages.push(pkg);
     }
 
-    if (createGithubReleases) {
+    if (createGithubReleases === true) {
       await Promise.all(
         releasedPackages.map((pkg) =>
           createRelease(octokit, {
@@ -121,6 +175,13 @@ export async function runPublish({
             tagName: `${pkg.packageJson.name}@${pkg.packageJson.version}`,
           })
         )
+      );
+    } else if (createGithubReleases === "aggregate") {
+      await createAggregatedRelease(
+        octokit,
+        releasedPackages,
+        githubReleaseName,
+        githubTagName
       );
     }
   } else {
@@ -131,25 +192,19 @@ export async function runPublish({
       );
     }
     let pkg = packages[0];
-    let newTagRegex = /New tag:/;
 
-    for (let line of changesetPublishOutput.stdout.split("\n")) {
-      let match = line.match(newTagRegex);
-
-      if (match) {
-        releasedPackages.push(pkg);
-        if (createGithubReleases) {
-          await createRelease(octokit, {
-            pkg,
-            tagName: `v${pkg.packageJson.version}`,
-          });
-        }
-        break;
+    if (Array.from(lines).length) {
+      releasedPackages.push(pkg);
+      if (createGithubReleases) {
+        await createRelease(octokit, {
+          pkg,
+          tagName: `v${pkg.packageJson.version}`,
+        });
       }
     }
   }
 
-  if (releasedPackages.length) {
+  if (releasedPackages.length && publishedSucceed) {
     return {
       published: true,
       publishedPackages: releasedPackages.map((pkg) => ({
@@ -165,8 +220,8 @@ export async function runPublish({
 const requireChangesetsCliPkgJson = (cwd: string) => {
   try {
     return require(resolveFrom(cwd, "@changesets/cli/package.json"));
-  } catch (err: any) {
-    if (err && err.code === "MODULE_NOT_FOUND") {
+  } catch (err) {
+    if (err && (err as any).code === "MODULE_NOT_FOUND") {
       throw new Error(
         `Have you forgotten to install \`@changesets/cli\` in "${cwd}"?`
       );
@@ -322,11 +377,12 @@ export async function runVersion({
     }`;
     await gitUtils.commitAll(finalCommitMessage);
   }
+  console.log('Is not clean!');
 
   await gitUtils.push(versionBranch, { force: true });
 
   let searchResult = await searchResultPromise;
-  console.log(JSON.stringify(searchResult.data, null, 2));
+  console.log('searchResult', JSON.stringify(searchResult.data, null, 2));
 
   const changedPackagesInfo = (await changedPackagesInfoPromises)
     .filter((x) => x)

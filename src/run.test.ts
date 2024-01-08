@@ -4,7 +4,8 @@ import fs from "fs-extra";
 import path from "path";
 import writeChangeset from "@changesets/write";
 import { Changeset } from "@changesets/types";
-import { runVersion } from "./run";
+import { runVersion, runPublish } from "./run";
+import * as Utils from "./utils";
 
 jest.mock("@actions/github", () => ({
   context: {
@@ -18,6 +19,16 @@ jest.mock("@actions/github", () => ({
   getOctokit: jest.fn(),
 }));
 jest.mock("./gitUtils");
+
+let mockedExecResponse: Awaited<ReturnType<typeof Utils.execWithOutput>> = {
+  code: 1,
+  stderr: "",
+  stdout: "",
+};
+
+jest
+  .spyOn(Utils, "execWithOutput")
+  .mockImplementation(() => Promise.resolve(mockedExecResponse));
 
 let mockedGithubMethods = {
   search: {
@@ -43,6 +54,19 @@ const linkNodeModules = async (cwd: string) => {
 const writeChangesets = (changesets: Changeset[], cwd: string) => {
   return Promise.all(changesets.map((commit) => writeChangeset(commit, cwd)));
 };
+
+const PUBLISHED_OUTPUT_MOCK = [
+  `🦋  info npm info simple-project-pkg-a`,
+  `🦋  info npm info simple-project-pkg-b`,
+  `🦋  info simple-project-pkg-a is being published because our local version (0.0.1) has not been published on npm`,
+  `🦋  info simple-project-pkg-b is being published because our local version (0.0.1) has not been published on npm`,
+  `🦋  info my-pkg/pkg-3 is being published because our local version (0.0.1) has not been published on npm`,
+  `🦋  info Publishing "simple-project-pkg-a" at "0.0.1"`,
+  `🦋  info Publishing "simple-project-pkg-b" at "0.0.1"`,
+  `🦋  success packages published successfully:`,
+  `🦋  simple-project-pkg-a@0.0.1`,
+  `🦋  simple-project-pkg-b@0.0.1`,
+];
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -274,5 +298,101 @@ fluminis divesque vulnere aquis parce lapsis rabie si visa fulmineis.
     expect(mockedGithubMethods.pulls.create.mock.calls[0][0].body).toMatch(
       /All release information have been omitted from this message, as the content exceeds the size limit/
     );
+  });
+});
+
+describe("publish", () => {
+  it("should create a github release per each package by default", async () => {
+    let cwd = f.copy("simple-project-published");
+    linkNodeModules(cwd);
+
+    // Fake a publish command result
+    mockedExecResponse = {
+      code: 0,
+      stderr: "",
+      stdout: PUBLISHED_OUTPUT_MOCK.join("\n"),
+    };
+
+    // Fake a CHANGELOG.md files
+
+    const response = await runPublish({
+      githubToken: "@@GITHUB_TOKEN",
+      createGithubReleases: true,
+      script: "npm run release",
+      cwd,
+    });
+
+    expect(response.published).toBeTruthy();
+    response.published && expect(response.publishedPackages.length).toBe(2);
+    expect(mockedGithubMethods.repos.createRelease.mock.calls.length).toBe(2);
+    expect(mockedGithubMethods.repos.createRelease.mock.calls[0][0].name).toBe(
+      "simple-project-pkg-a@0.0.1"
+    );
+    expect(mockedGithubMethods.repos.createRelease.mock.calls[1][0].name).toBe(
+      "simple-project-pkg-b@0.0.1"
+    );
+  });
+
+  it("should create an aggregated github release when createGithubReleases: aggreate is set", async () => {
+    let cwd = f.copy("simple-project-published");
+    linkNodeModules(cwd);
+
+    // Fake a publish command result
+    mockedExecResponse = {
+      code: 0,
+      stderr: "",
+      stdout: PUBLISHED_OUTPUT_MOCK.join("\n"),
+    };
+
+    const response = await runPublish({
+      githubToken: "@@GITHUB_TOKEN",
+      createGithubReleases: "aggregate",
+      script: "npm run release",
+      githubReleaseName: "", // make sure empty string is treat as undefined parameter
+      cwd,
+    });
+
+    expect(response.published).toBeTruthy();
+    response.published && expect(response.publishedPackages.length).toBe(2);
+    expect(mockedGithubMethods.repos.createRelease.mock.calls.length).toBe(1);
+    const params = mockedGithubMethods.repos.createRelease.mock.calls[0][0];
+
+    expect(params.name).toEqual(expect.stringContaining("Release "));
+    expect(params.body).toContain(`## simple-project-pkg-a@0.0.1`);
+    expect(params.body).toContain(`## simple-project-pkg-b@0.0.1`);
+    expect(params.body).toContain(`change something in a`);
+    expect(params.body).toContain(`change something in b`);
+  });
+
+  it("should allow to customize release title with createGithubReleases: aggreate", async () => {
+    let cwd = f.copy("simple-project-published");
+    linkNodeModules(cwd);
+
+    // Fake a publish command result
+    mockedExecResponse = {
+      code: 0,
+      stderr: "",
+      stdout: PUBLISHED_OUTPUT_MOCK.join("\n"),
+    };
+
+    const response = await runPublish({
+      githubToken: "@@GITHUB_TOKEN",
+      createGithubReleases: "aggregate",
+      script: "npm run release",
+      githubReleaseName: `My Test Release`,
+      githubTagName: `mytag`,
+      cwd,
+    });
+
+    expect(response.published).toBeTruthy();
+    response.published && expect(response.publishedPackages.length).toBe(2);
+    expect(mockedGithubMethods.repos.createRelease.mock.calls.length).toBe(1);
+    const params = mockedGithubMethods.repos.createRelease.mock.calls[0][0];
+
+    expect(params.name).toBe("My Test Release");
+    expect(params.body).toContain(`## simple-project-pkg-a@0.0.1`);
+    expect(params.body).toContain(`## simple-project-pkg-b@0.0.1`);
+    expect(params.body).toContain(`change something in a`);
+    expect(params.body).toContain(`change something in b`);
   });
 });
